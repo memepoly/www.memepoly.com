@@ -1,8 +1,7 @@
-import { Environment, Html, Text } from "@react-three/drei"
-
-import { Suspense, useEffect, useRef, useState, useMemo } from "react"
-
+import { Environment, Text } from "@react-three/drei"
+import { Suspense, useEffect, useLayoutEffect, useRef, useState, useMemo, memo } from "react"
 import { Player } from "./Player"
+import { RoomAsset, RoomGrid } from "./RoomWorld"
 
 import * as THREE from "three"
 import { useFrame, useThree, useLoader } from "@react-three/fiber"
@@ -23,33 +22,422 @@ const textures = {
 	// log : new THREE.TextureLoader().load(logImg),
 	black : new THREE.TextureLoader().load(blackImg)
 }
-
-// textures.dirt.magFilter = THREE.NearestFilter
-// textures.dirt.minFilter = THREE.LinearMipMapLinearFilter
 textures.grass.magFilter = THREE.NearestFilter
 textures.grass.minFilter = THREE.LinearMipMapLinearFilter
 textures.glass.magFilter = THREE.NearestFilter
 textures.glass.minFilter = THREE.LinearMipMapLinearFilter
-// textures.wood.magFilter = THREE.NearestFilter
-// textures.wood.minFilter = THREE.LinearMipMapLinearFilter
-// textures.log.magFilter = THREE.NearestFilter
-// textures.log.minFilter = THREE.LinearMipMapLinearFilter
 textures.black.magFilter = THREE.NearestFilter
 textures.black.minFilter = THREE.LinearMipMapLinearFilter
 
-var fields = Fields()
-
-fields.forEach(function(field, index){
-	if(index % 9 == 0){
-		field.drop = "❓"
-	}else if(index % 3 == 0){
-		field.item = "❔"
+var PropertyLevelEmoji = ["", "🪵", "🏠", "🏪", "🏰"]
+var OwnerTextures = {}
+var OwnerTextureLimit = 64
+var TileTypes = {}
+var TilePoint = {}
+var TileClickRef = { fn : null }
+var TileClick = function(e){
+    if(TileClickRef.fn){
+        return TileClickRef.fn(e)
+    }
+}
+var TileSame = function(a, b){
+    if(a.uid !== b.uid){
+        return false
+    }
+    if(a.hash !== b.hash){
+        return false
+    }
+    if(a.name !== b.name){
+        return false
+    }
+    if(a.value !== b.value){
+        return false
+    }
+    if(a.color !== b.color){
+        return false
+    }
+    if(a.blast !== b.blast){
+        return false
+    }
+    if(a.own !== b.own){
+        return false
+    }
+    if(a.deco !== b.deco){
+        return false
+    }
+    if(a.zone !== b.zone){
+        return false
+    }
+    var p = a.position
+    var q = b.position
+    if(!p || !q){
+        return p === q
+    }
+    return p.x === q.x && p.y === q.y && p.z === q.z
+}
+var TilePure = function(name, fn){
+    if(!TileTypes[name]){
+        TileTypes[name] = memo(fn, TileSame)
+    }
+    return TileTypes[name]
+}
+var TileStable = function(name, fn){
+    if(!TileTypes[name]){
+        TileTypes[name] = fn
+    }
+    return TileTypes[name]
+}
+var BOX_GEO = new THREE.BoxGeometry(1, 1, 1)
+var PlaneGeoCache = {}
+var planeGeo = function(w, h){
+    var key = w + "x" + h
+    if(!PlaneGeoCache[key]){
+        PlaneGeoCache[key] = new THREE.PlaneGeometry(w, h)
+    }
+    return PlaneGeoCache[key]
+}
+var VecCache = {}
+var tileVec = function(id, x, y, z){
+    var v = VecCache[id]
+    if(v && v.x === x && v.y === y && v.z === z){
+        return v
+    }
+    v = new THREE.Vector3(x, y, z)
+    VecCache[id] = v
+    return v
+}
+var MarkerList = []
+var MarkerHost = null
+var MarkerVec = new THREE.Vector3()
+var MarkerTick = 0
+var MarkerStep = 6
+var markerHost = function(gl){
+    if(MarkerHost && MarkerHost.parentNode){
+        return MarkerHost
+    }
+    var parent = (gl && gl.domElement) ? gl.domElement.parentNode : null
+    if(!parent){
+        return null
+    }
+    var host = parent.querySelector(".r3f_markers")
+    if(!host){
+        host = document.createElement("div")
+        host.className = "r3f_markers"
+        host.style.cssText = "position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible;pointer-events:none;"
+        parent.appendChild(host)
+    }
+    MarkerHost = host
+    return host
+}
+var markerHtml = function(children){
+    var child = null
+    if(children && children.props){
+        child = children
+    }else if(children && children.length){
+        child = children[0]
+    }
+    if(!child || !child.props){
+        return ""
+    }
+    var p = child.props
+    var attrs = ""
+    if(typeof p.level !== "undefined"){
+        attrs += ' level="' + p.level + '"'
+    }
+    if(typeof p.href !== "undefined"){
+        attrs += ' href="' + p.href + '"'
+    }
+    if(typeof p.src !== "undefined"){
+        attrs += ' src="' + p.src + '"'
+    }
+    var body = ""
+    if(typeof p.children === "string" || typeof p.children === "number"){
+        body = String(p.children)
+    }
+    return '<div class="' + (p.className ? p.className : "") + '"' + attrs +
+        ' x="' + p.x + '" z="' + p.z + '">' + body + '</div>'
+}
+var MarkerSync = function(state){
+    MarkerTick++
+    if(MarkerTick % MarkerStep !== 0){
+        return
+    }
+    if(!MarkerList.length){
+        return
+    }
+    var cam = state.camera
+    var w = state.size.width / 2
+    var h = state.size.height / 2
+    for(var i = 0; i < MarkerList.length; i++){
+        var m = MarkerList[i]
+        if(!m.obj || !m.el){
+            continue
+        }
+        MarkerVec.setFromMatrixPosition(m.obj.matrixWorld)
+        MarkerVec.project(cam)
+        var px = Math.round((MarkerVec.x * w) + w)
+        var py = Math.round((-MarkerVec.y * h) + h)
+        if(m.px === px && m.py === py){
+            continue
+        }
+        m.px = px
+        m.py = py
+        m.el.style.transform = "translate3d(" + px + "px," + py + "px,0)"
+    }
+}
+var IdleFrames = 0
+var IdleCache = { cx : 0, cy : 0, cz : 0, px : 0, pz : 0, ux : 0, uz : 0 }
+var IdleMoved = function(state){
+    var moved = false
+    var cam = state.camera
+    if(Math.abs(cam.position.x - IdleCache.cx) > 0.001 ||
+        Math.abs(cam.position.y - IdleCache.cy) > 0.001 ||
+        Math.abs(cam.position.z - IdleCache.cz) > 0.001){
+        moved = true
+        IdleCache.cx = cam.position.x
+        IdleCache.cy = cam.position.y
+        IdleCache.cz = cam.position.z
+    }
+    try{
+        var cur = window.current.current.position
+        if(cur.x !== IdleCache.px || cur.z !== IdleCache.pz){
+            moved = true
+            IdleCache.px = cur.x
+            IdleCache.pz = cur.z
+        }
+    }catch(err){
+    }
+    try{
+        var cs = window.cursor.current.position
+        if(cs.x !== IdleCache.ux || cs.z !== IdleCache.uz){
+            moved = true
+            IdleCache.ux = cs.x
+            IdleCache.uz = cs.z
+        }
+    }catch(err){
+    }
+    try{
+        if(window.RollBusy && window.RollBusy()){
+            moved = true
+        }
+    }catch(err){
+    }
+    return moved
+}
+function Html(props){
+    var ref = useRef()
+    var gl = useThree(function(s){ return s.gl })
+    var el = useMemo(function(){
+        var d = document.createElement("div")
+        d.style.cssText = "position:absolute;top:0;left:0;transform-origin:0 0;will-change:transform;pointer-events:none;"
+        return d
+    }, [])
+    var inner = markerHtml(props.children)
+    useLayoutEffect(function(){
+        el.className = props.className ? props.className : ""
+        el.innerHTML = inner
+    }, [inner, props.className])
+    useLayoutEffect(function(){
+        var host = markerHost(gl)
+        if(!host){
+            return
+        }
+        host.appendChild(el)
+        var entry = { obj : ref.current, el : el, px : -99999, py : -99999 }
+        MarkerList.push(entry)
+        return function(){
+            var at = MarkerList.indexOf(entry)
+            if(at > -1){
+                MarkerList.splice(at, 1)
+            }
+            if(el.parentNode){
+                el.parentNode.removeChild(el)
+            }
+        }
+    }, [])
+    return <group ref={ref} />
+}
+var blastTexture = null
+window.BlastTexture = function(){
+    if(blastTexture){
+        return blastTexture
+    }
+    var hex = "1f4a5"
+    try{
+        if(window.BlastHex){
+            hex = window.BlastHex()
+        }else if(window.emojiUnicode){
+            var h = window.emojiUnicode("💥")
+            if(h){
+                hex = h
+            }
+        }
+    }catch(err){
+        hex = "1f4a5"
+    }
+    try{
+        var loader = new THREE.TextureLoader()
+        var t = loader.load("/src/fonts/emoji/animated/" + hex + ".webp", null, null, function(){
+            loader.load("/src/fonts/emoji/emoji_u" + hex + ".png", function(png){
+                t.image = png.image
+                t.needsUpdate = true
+            })
+        })
+        t.magFilter = THREE.LinearFilter
+        t.minFilter = THREE.LinearMipMapLinearFilter
+        blastTexture = t
+    }catch(err){
+        blastTexture = null
+    }
+    return blastTexture
+}
+window.OwnerTexture = function(hash){
+	var seed = ""
+	try{
+		seed = String(hash ? hash : "").replace("0x","").toLowerCase()
+	}catch(err){
+		seed = ""
 	}
-
-	field.index = index
-
-	fields[`${field.x}:${field.z}`] = field
-})
+	if(!seed){
+		return null
+	}
+	if(OwnerTextures[seed]){
+		return OwnerTextures[seed]
+	}
+	try{
+		var canvas = window.Blockie
+			? window.Blockie(seed)
+			: blockies.create({ seed : "0x" + seed })
+		if(!canvas){
+			return null
+		}
+		var t = new THREE.CanvasTexture(canvas)
+		t.magFilter = THREE.NearestFilter
+		t.minFilter = THREE.NearestFilter
+		t.needsUpdate = true
+		var keys = Object.keys(OwnerTextures)
+		if(keys.length >= OwnerTextureLimit){
+			try{
+				OwnerTextures[keys[0]].dispose()
+			}catch(err){
+			}
+			delete OwnerTextures[keys[0]]
+		}
+		OwnerTextures[seed] = t
+		return t
+	}catch(err){
+		return null
+	}
+}
+/*
+	타일의 소유자 해시를 고른다.
+	  nation / ZERO  국가 또는 경매 대상이므로 아이콘을 쓰지 않는다
+	  그 외          owner 를 그대로 쓴다
+	빈 문자열이면 소유자가 없다는 뜻이다.
+*/
+window.TileOwner = function(field){
+	if(!field || !field.property){
+		return ""
+	}
+	/*
+		개발 Part 87 (즉시 구매)
+		현행은 level 0 이면 무조건 "" 를 돌려줬다.
+		즉시 구매로 "주인은 있는데 건물은 없는" 칸이 생기므로
+		그 조건을 제거한다.
+		주인 없는 빈 땅은 아래 owner 검사에서 걸러진다.
+		  owner 미설정   -> ""
+		  ZERO(국유/경매) -> ""
+		국가 부동산은 level > 0 + owner 없음이라
+		바로 아래 nation 검사가 계속 담당한다.
+	*/
+	if(field.property.nation){
+		return ""
+	}
+	var owner = field.property.owner ? String(field.property.owner) : ""
+	if(!owner){
+		return ""
+	}
+	var flat = owner.replace("0x","").toLowerCase()
+	if(flat === "0000000000000000000000000000000000000000"){
+		return ""
+	}
+	return flat
+}
+var fields = []
+window.FieldsSync = function(force){
+	var key = ""
+	try{
+		key = window.MapGen ? window.MapGen.key : ""
+	}catch(err){
+	}
+	if(!force && window.fields && window.FieldsSync.key === key && window.fields.length){
+		return window.fields
+	}
+	var hash = ""
+	try{
+		hash = window.MapGen && window.MapGen.target() ? window.MapGen.target().hash : ""
+	}catch(err){
+	}
+	var next = window.Fields(hash)
+	var _isRing = next.ring ? true : false
+	next.forEach(function(field, index){
+		if(_isRing){
+			/*
+				개발 Part 91 (특수칸 배열 - 8슬롯 주기)
+				worldService.toTileRows 와 완전히 같은 식이어야 한다.
+				  slot = index / 3
+				  slot % 8 === 3   jail  ❓ 빨강
+				  slot % 8 === 7   gate  🚪 도어
+				  그 외              item  ❔ 흰색
+				화면 배열이 정확히 이렇게 반복된다.
+				  ❔ ❔ ❔ ❓ ❔ ❔ ❔ 🚪 ...
+				jail 에는 drop 을 주지 않는다.
+				  서버가 field.drop 으로 게이트 드랍 소각을 판정하므로
+				  감옥에 붙이면 갇히면서 소지품까지 잃는다.
+				  렌더는 jail 분기가 ❓ 를 상수로 그리므로 drop 이 필요 없다.
+				gate 의 drop "❓" 는 표시용이 아니라 판정용이다.
+				  ReservedTile(gate) / EdgeField 표시 / 탈출 버튼 노출에 쓰인다.
+				  화면의 🚪 는 gate 분기가 상수로 그린다.
+			*/
+			if(index % 3 == 0){
+				var _slot = index / 3
+				if(_slot % 8 == 3){
+					field.jail = true
+				}else if(_slot % 8 == 7){
+					field.drop = "❓"
+					field.gate = true
+				}else{
+					field.item = "❔"
+				}
+			}
+		}
+		field.index = index
+		var b = window.map && window.map.biomes ? window.map.biomes[`${field.x}:${field.z}`] : null
+		if(b){
+			field.biome = "#" + b.biome
+			field.y = b.y
+			field.water = b.water ? true : false
+		}
+		if(!field.property){
+			field.property = {
+				level: 0,
+				owner: "",
+				type: "empty",
+				toll: 0,
+				cost: window.PropertyCost,
+				tollTable: window.PropertyToll,
+				materials: window.PropertyMaterials
+			}
+		}
+		next[`${field.x}:${field.z}`] = field
+	})
+	fields = next
+	window.fields = next
+	window.FieldsSync.key = key
+	return next
+}
+window.FieldsSync.key = null
+window.FieldsSync()
 
 
 export const Experience = () => {
@@ -59,11 +447,23 @@ export const Experience = () => {
 
 	const [camera, setCamera] = useState({});
 
-	const far = {
+	const [selector, setSelector] = useState({});
+
+	const [grid, setGrid] = useState([]);
+
+	const [far, setFar] = useState({
 		x : 4.5,
 		y : 5.5,
 		z : 4.5
-	}
+	});
+
+	grid.size = 40
+	grid.edge = 10 - 1
+
+	grid.x = grid.size
+	grid.z = grid.size
+	grid.center = "#000"
+	grid.line = "#000"
 
 	const current = useRef()
 	const cursor = useRef()
@@ -73,31 +473,76 @@ export const Experience = () => {
 
 	const self = function(){
 		var cookies = window.cookies
+		if(!cookies){
+			return null
+		}
 		var player_hash = cookies.address ? cookies.address : cookies.hash
+		if(!player_hash){
+			return null
+		}
 		var player = window[player_hash]
-
 		if(player){
 			if(window[player_hash].group.current == null && player.position){
 				window[player_hash].group.current = player.position
 			}
 		}else{
 			var position
-
-			if(cookies.axis){
-				var _axis = cookies.axis
-					_axis = _axis.split(",")
-
-				var b = window.map.biomes[`${_axis[0]}:${_axis[2]}`]
-
-				position = {
-					x : _axis[0] * 1,
-					y : b.y,
-					z : _axis[2] * 1
+			if(window.Mode() == "room"){
+				if(window.MapGen && window.MapGen.ready && fields.length){
+					var _rr, _rb
+					for(var _ri = 0; _ri < fields.length; _ri++){
+						_rr = fields[Math.floor(Math.random() * fields.length)]
+						_rb = window.map.biomes[`${_rr.x}:${_rr.z}`]
+						if(_rb && !_rb.water){
+							break
+						}
+					}
+					if(!_rr){ _rr = fields[0] }
+					if(!_rb){ _rb = { y : 0.5 } }
+					position = {
+						x : _rr.x,
+						y : _rb.y,
+						z : _rr.z
+					}
+				}else{
+					position = {
+						x : 1.5,
+						y : 0.5,
+						z : 1.5
+					}
 				}
-			}else{
-				var r = fields[Math.round(Math.random() * fields.length)]
+			}else if(cookies.axis){
+				var _ax = window.AxisParse ? window.AxisParse(cookies.axis) : null
+				if(_ax && _ax.ok){
+					position = {
+						x : _ax.x,
+						y : _ax.y,
+						z : _ax.z
+					}
+				}
+			}
 
-				var b = window.map.biomes[`${r.x}:${r.z}`]
+			if(!position){
+				var r, b
+
+				for(var i = 0; i < fields.length; i++){
+					r = fields[Math.floor(Math.random() * fields.length)]
+					b = window.map.biomes[`${r.x}:${r.z}`]
+
+					if(b){
+						if(!b.water){
+							break
+						}
+					}
+				}
+
+				if(!r){
+					r = fields[0]
+				}
+
+				if(!b){
+					b = { y : 0.5 }
+				}
 
 				position = {
 					x : r.x,
@@ -123,20 +568,76 @@ export const Experience = () => {
 			}
 		}
 
+		var _position = player.position
+
+		try{
+			if(window.Mode() == "room"){
+				if(current.current){
+					_position = current.current.position
+				}
+			}
+		}catch(err){
+
+		}
+
 		return {
 			emoji : player.emoji,
 			hash : player.hash,
 			follow : player.follow,
 			self : player.self,
 			team : player.team,
-			x : player.position.x,
+			type : player.type,
+			x : _position.x,
 			y : player.position.y,
-			z : player.position.z
+			z : _position.z
 		}
 	}
 
+	var interval = function(){
+		if(OAuth3.after){
+			if(OAuth3.before == OAuth3.after){
+				clearInterval(OAuth3.interval)
+
+				OAuth3.interval = undefined
+				OAuth3.after = undefined
+				OAuth3.before = undefined
+			}
+		}		
+		
+		if(OAuth3.before){
+			OAuth3.after = OAuth3.before
+		}
+	}
+
+	window.RoomInterval = interval
+
 	useFrame((e,delta) => {
 		var cookies = window.cookies
+		if(window.Mode() == "room" && !(window.MapGen && window.MapGen.ready)){
+			try{
+				current.current.position.y = 0
+				cursor.current.position.y = -0.001
+			}catch(err){
+			}
+		}else{
+			try{
+				var _cu = cursor.current
+				if(_cu){
+					var _cb = window.map.biomes[_cu.position.x + ":" + _cu.position.z]
+					if(_cb && typeof _cb.y !== "undefined"){
+						var _cl = window.CursorLift ? window.CursorLift * 1 : 0.06
+						if(isNaN(_cl)){
+							_cl = 0.06
+						}
+						var _want = (_cb.y * 1) + _cl
+						if(Math.abs(_cu.position.y - _want) > 0.005){
+							_cu.position.y = _want
+						}
+					}
+				}
+			}catch(err){
+			}
+		}
 		
 		if(cookies){
 			var position
@@ -159,52 +660,160 @@ export const Experience = () => {
 
 			if(position){
 				var fov = 1
-
 				if(window.flutter_inappwebview){
 					if(cookies.address){
 						fov = 0.5
 					}
 				}
-
-				if(window.frameloop == "always"){
-					var vec = new THREE.Vector3(position.x,position.y-fov,position.z)
-					e.camera?.lookAt(vec)
-					e.camera.position.lerp(new THREE.Vector3(position.x+far.x,position.y+far.y,position.z+far.z ), 0.2)
+				var _cv = window.__camVec
+				if(!_cv){
+					_cv = window.__camVec = {
+						target : new THREE.Vector3(),
+						look : new THREE.Vector3()
+					}
+				}
+				var _camTarget = _cv.target.set(position.x+far.x, position.y+far.y, position.z+far.z)
+				var _camLook = _cv.look.set(position.x, position.y-fov, position.z)
+				if(window.Snap > 0){
+					e.camera.position.copy(_camTarget)
+					e.camera?.lookAt(_camLook)
+				}else{
+					var _cdt = (typeof delta === "number" && delta > 0 && delta < 0.25) ? delta : (1 / 60)
+					var _ctau = window.CamTau ? window.CamTau * 1 : 0.12
+					if(isNaN(_ctau) || _ctau <= 0){
+						_ctau = 0.12
+					}
+					var _ct = 1 - Math.exp(-_cdt / _ctau)
+					if(_ct > 1){ _ct = 1 }
+					e.camera.position.lerp(_camTarget, _ct)
+					e.camera?.lookAt(_camLook)
+				}
+				if(OAuth3.interval){
+					if(!OAuth3.after){
+						if(window.frameloop == "demand"){
+							window.setFrameloop("always")
+						}
+					}
+					OAuth3.before = position.x
 				}
 			}
 		}
+		MarkerSync(e)
+		if(window.Snap > 0){
+			window.Snap = window.Snap - 1
+			IdleFrames = 0
+			return
+		}
+		if(IdleMoved(e)){
+			IdleFrames = 0
+			return
+		}
+		IdleFrames++
+		if(IdleFrames <= 90){
+			return
+		}
+		IdleFrames = 0
+		try{
+			if(window.Mode() == "room"){
+				return
+			}
+			if(window.frameloop === "always" && window.setFrameloop){
+				window.setFrameloop("demand")
+			}
+		}catch(err){
+		}
 	})
 
-	var point = {}
-
-	var onClick = function(e){
+    var point = TilePoint
+    TileClickRef.fn = function(e){
+		try{
+			var $b = $("body")
+			var _gateRoom = window.Mode() == "room"
+			if($b.attr("myroom") || $b.attr("panel")){
+				return
+			}
+			if(!_gateRoom && ($b.attr("dead") || $b.attr("stage"))){
+				return
+			}
+		}catch(err){
+		}
+		if(window.Mode() == "room" && !(window.MapGen && window.MapGen.ready)){
+			if(window.RoomClick){
+				return window.RoomClick(e)
+			}
+			return
+		}
+		if(window.MapGen && !window.MapGen.ready){
+			try{
+				window.MapGen.apply()
+			}catch(err){
+			}
+		}
 		var cookies = window.cookies
-
 		try{
 			if(cookies){
-				if(cookies.axis && !cookies.damage){
+				var _isRoom = window.Mode() == "room"
+				var _canMove = _isRoom
+					? true
+					: (window.CanFreeMove ? window.CanFreeMove() : true)
+				if((_isRoom || cookies.axis) && (_isRoom || !cookies.damage)){
 					if(e.point){
 						var _point = new THREE.Vector3().copy(e.point).round().addScalar(0.5)
-
-						var biome = window.map.biomes[_point.x+":"+_point.z]
-
-						if(biome.water){
-							return
-						}
-
-						point = _point
-					}else if(e.target.tagName == "CANVAS"){
+                        var biome = window.map.biomes[_point.x+":"+_point.z]
+                        if(!biome){
+                            return
+                        }
+                        if(biome.water){
+                            return
+                        }
+                        TilePoint.x = _point.x
+                        TilePoint.y = _point.y
+                        TilePoint.z = _point.z
+                        point = TilePoint
+                    }else if(e.target.tagName == "CANVAS"){
 						if(typeof point.x != "undefined" && typeof point.z != "undefined"){
 							var player = self()
-
 							var biome = window.map.biomes[point.x+":"+point.z]
-
+							if(!biome){
+								return
+							}
 							point.y = biome.y
-
 							if(cursor.current.position.x == point.x && cursor.current.position.z == point.z){
+								if(!_canMove){
+									try{
+										if(cookies.damage || cookies.dead){
+											window.Notice("DEAD", "Go to My Room", 2000)
+										}else if((cookies.dice * 1) > 0){
+											window.Notice("ROLLING", "Wait for the dice", 1600)
+										}else if(!cookies.enter){
+											window.Notice("BOARD MODE", "Roll the dice to move", 2000)
+										}
+									}catch(err){
+									}
+									return
+								}
+								if(!_isRoom && window.CanMoveTo && !window.CanMoveTo(point.x, point.z)){
+									try{
+										var _mr = window.CanMoveTo.reason
+										if(_mr === "anchor"){
+											var _ma = window.RingAnchor ? window.RingAnchor() : null
+											window.Notice("BOARD PATH",
+												_ma
+													? ("Return through " + Math.floor(_ma.x) + ", " + Math.floor(_ma.z))
+													: "You cannot step onto the board path here",
+												2600)
+										}else if(_mr === "noanchor"){
+											window.Notice("BOARD PATH",
+												"You cannot step onto the board path here", 2200)
+										}else{
+											window.Notice("FIELD ONLY", "UCAV cannot enter the board path", 2200)
+										}
+									}catch(err){
+									}
+									return
+								}
 								if(cookies.hash && players.length){
 									if(player.x == cursor.current.position.x && player.z == cursor.current.position.z){
-
 									}else{
 										if(window.camera){
 											if(window.camera.hash){
@@ -213,11 +822,12 @@ export const Experience = () => {
 												}
 											}
 										}
-
 										window[player.hash].position.y = point.y + 0.5
-										
-										current.current.position.y = point.y + 0.01
-
+										var _tlift = window.TileLift ? window.TileLift * 1 : 0.02
+										if(isNaN(_tlift)){
+											_tlift = 0.02
+										}
+										current.current.position.y = point.y + _tlift
 										window[player.hash].position.x = current.current.position.x = point.x
 										window[player.hash].position.z = current.current.position.z = point.z
 
@@ -232,9 +842,9 @@ export const Experience = () => {
 										$("emojis").removeClass("on");
 										$("tooltip").removeClass("on");
 										$("#capture>.icon").html('')
-
-										// maker
-										$(".map").css({top : - ((point.z * 2) + 100) , left : - ((point.x * 2) + 0) })
+										if(!(window.MapFocus && window.MapFocus(point.x, point.z))){
+											$(".map").css({top : - ((point.z * 2) + 100) , left : - ((point.x * 2) + 0) })
+										}
 										$(".xyz").text(`${Math.floor(point.x)} : ${Math.floor(point.z)}`)
 
 										var url = "https://emption.red"
@@ -320,8 +930,12 @@ export const Experience = () => {
 									}
 								}
 							}else{
+								var _clift = window.CursorLift ? window.CursorLift * 1 : 0.06
+								if(isNaN(_clift)){
+									_clift = 0.06
+								}
 								cursor.current.position.x = point.x
-								cursor.current.position.y = point.y + 0.01
+								cursor.current.position.y = point.y + _clift
 								cursor.current.position.z = point.z
 							}
 						}
@@ -331,13 +945,124 @@ export const Experience = () => {
 		}catch(err){
 			console.log("err",err);
 		}
-	}
-
-	const onContextmenu = function(e){
-		e.preventDefault();
-	}
-
-	const Asset = function(props){
+    }
+    var onClick = TileClick
+    const onContextmenu = function(e){
+        e.preventDefault();
+    }
+    const ChordTile = TilePure("ChordTile", function(props){
+		var cells = useMemo(function(){
+			var out = []
+			for(var _cx = -1; _cx < 2; _cx++){
+				for(var _cz = -1; _cz < 2; _cz++){
+					var bx = props.position.x + _cx
+					var bz = props.position.z + _cz
+					var b = null
+					try{
+						b = window.map.biomes[bx + ":" + bz]
+					}catch(err){
+					}
+					if(!b){
+						continue
+					}
+					if(b.water){
+						continue
+					}
+					out.push({
+						key : bx + ":" + bz,
+						x : _cx,
+						y : (b.y + 0.02) - props.position.y,
+						z : _cz
+					})
+				}
+			}
+			return out
+		}, [props.position.x, props.position.z, props.position.y])
+        return <>
+            <group position={props.position}>
+                {cells.map(function(c){
+                    return <mesh key={c.key} rotation-x={-Math.PI / 2} position={[c.x, c.y, c.z]} onClick={onClick}>
+                        <planeGeometry attach="geometry" args={[0.9, 0.9]} />
+                        <meshStandardMaterial attach="material" color={props.color ? props.color : "yellow"} transparent opacity={0.55} />
+                    </mesh>
+                })}
+            </group>
+        </>
+    })
+    const OpenTile = TilePure("OpenTile", function(props){
+        var isBlast = props.blast ? true : false
+        var texture = useMemo(function(){
+            try{
+                var _seed = (props.hash + "")
+                if(_seed.indexOf("0x") != 0){
+                    _seed = "0x" + _seed
+                }
+                var _canvas = blockies.create({
+                    seed : _seed.toLowerCase(),
+                    size : 8,
+                    scale : 8
+                })
+                var _t = new THREE.CanvasTexture(_canvas)
+                _t.magFilter = THREE.NearestFilter
+                _t.minFilter = THREE.NearestFilter
+                _t.needsUpdate = true
+                return _t
+            }catch(err){
+                return null
+            }
+        }, [props.hash])
+        var blast = useMemo(function(){
+            if(!isBlast){
+                return null
+            }
+            return window.BlastTexture ? window.BlastTexture() : null
+        }, [isBlast])
+        if(!texture){
+            return <>
+                <group position={props.position}>
+                    <group></group>
+                </group>
+            </>
+        }
+        var showNumber = (!isBlast && props.value) ? true : false
+        return <>
+            <group position={props.position}>
+                <mesh rotation-x={-Math.PI / 2} position={[0, 0.02, 0]} onClick={onClick}>
+                    <planeGeometry attach="geometry" args={[0.94, 0.94]} />
+                    <meshBasicMaterial
+                        attach="material"
+                        map={texture}
+                        transparent
+                        opacity={isBlast ? 0.45 : 0.92}
+                        color={isBlast ? "#ff5a5a" : "#ffffff"}
+                    />
+                </mesh>
+                {isBlast && blast ? (
+                    <mesh rotation-x={-Math.PI / 2} position={[0, 0.09, 0]}>
+                        <planeGeometry attach="geometry" args={[1.05, 1.05]} />
+                        <meshBasicMaterial attach="material" map={blast} transparent depthWrite={false} />
+                    </mesh>
+                ) : null}
+                {showNumber ? (
+                    <Text
+                        rotation-x={-Math.PI / 2}
+                        rotation-z={Math.PI / 0.0815}
+                        position={[0, 0.06, 0]}
+                        fontSize={0.42}
+                        color="#ffffff"
+                        outlineWidth={0.035}
+                        outlineColor="#000000"
+                        anchorX="center"
+                        anchorY="middle"
+                    >{props.value}</Text>
+                ) : null}
+                <Html className="clipped">
+                    <div className={isBlast ? "emoji color open blast" : "emoji color open"} x={props.position.x} z={props.position.z}></div>
+                </Html>
+            </group>
+        </>
+    })
+    const Asset = TilePure("Asset", function(props){
 		var cookies = window.cookies
 
 		var url = new URL(window.location.href)
@@ -396,54 +1121,192 @@ export const Experience = () => {
 			</>	
 		}else if(window.Biomes[props.name]){
 			var texture = 'glass'
-
 			var color = props.color
-
 			if(window.map.biomes[props.uid]){
-				emoji = window.Biomes[color]
+				var _biomeColor = window.Biomes[props.name]
+				emoji = window.Biomes[_biomeColor ? _biomeColor : color]
 			}
-
-			if(props.name == "#BEACH"){
-				if(props.color == "black"){
-					color = props.color
-
-
-					opacity = 0.5
-				}
+			if(props.color == "black"){
+				color = props.color
+				opacity = 0.5
 			}
-
 			if(biome){
 				if(biome.bomb && !biome.water){
 					texture = color = "black"
 				}
 			}
-
-			var field = fields[`${props.position.x}:${props.position.z}`]
+			var field = null
+			if(window.Mode() != "room"){
+				if(window.EdgeReady && window.EdgeReady()){
+					field = window.fields ? window.fields[`${props.position.x}:${props.position.z}`] : null
+				}
+			}
+			var exitZone = false
+			try{
+				if(!field && window.Mode() != "room" && window.ExitZone){
+					exitZone = window.ExitZone(props.position.x, props.position.z)
+				}
+			}catch(err){
+				exitZone = false
+			}
 
 			if(emoji){
 				if(field){
-					if(field.item || field.drop){
+					if(field.jail){
 						return <>
+						<group position={props.position}>
+							<mesh position={[0, 0, 0.005]} onClick={onClick}>
+								<boxGeometry attach="geometry" args={[1, 1]} />
+								<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color="#5a5a7a" />
+							</mesh>
+							<mesh rotation-x={rotation_x} rotation-z={Math.PI / 0.0815} position={[0, 0.52, 0]}>
+								<planeGeometry attach="geometry" args={[0.7, 0.7]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode("❓")}.png`)} transparent />
+							</mesh>
+							<Html className="clipped">
+								<div className="emoji color jail" x={props.position.x} z={props.position.z}></div>
+							</Html>
+						</group>
+						</>
+					}
+					if(field.gate){
+						return <>
+						<group position={props.position}>
+							<mesh position={[0, 0, 0.005]} onClick={onClick}>
+								<boxGeometry attach="geometry" args={[1, 1]} />
+								<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color="#ffcc00" />
+							</mesh>
+							<mesh rotation-y={Math.PI / 3.8} position={[0, 1, 0]}>
+								<planeGeometry attach="geometry" args={[1, 1]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(emoji)}.png`)} transparent />
+							</mesh>
+							<mesh rotation-x={rotation_x} rotation-z={Math.PI / 0.0815} position={[0, 0.52, 0]}>
+								<planeGeometry attach="geometry" args={[0.7, 0.7]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode("🚪")}.png`)} transparent />
+							</mesh>
+							<Html className="clipped">
+								<div className="emoji color gate" x={props.position.x} z={props.position.z}></div>
+							</Html>
+						</group>
+						</>
+					}
+					if(field.property && field.property.level > 0){
+						var propertyEmoji = PropertyLevelEmoji[field.property.level]
+						/*
+							개발 Part 70 (소유 타일 표시)
+							소유자가 있으면 바닥을 blockies 로 덮는다.
+							  ownerTex 없음  기존과 동일(바이옴 색)
+							  ownerTex 있음  0.02 띄운 평면을 얹어 소유를 표시한다
+							바닥 박스 자체를 바꾸지 않는 이유
+							  boxGeometry 는 6면에 같은 텍스처가 붙어
+							  옆면까지 아이콘이 늘어져 지저분해진다.
+							  윗면만 덮는 평면이 목적에 맞다.
+							useLoader 개수는 그대로 2개다. CanvasTexture 는 훅이 아니다.
+						*/
+						var ownerHash = window.TileOwner ? window.TileOwner(field) : ""
+						var ownerTex = ownerHash && window.OwnerTexture
+							? window.OwnerTexture(ownerHash) : null
+						return <>
+						<group position={props.position}>
+							<mesh position={[0, 0, 0.005]} onClick={onClick}>
+								<boxGeometry attach="geometry" args={[1, 1]} />
+								<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color={color} />
+							</mesh>
+							{ownerTex ? (
+								<mesh rotation-x={rotation_x} position={[0, 0.52, 0]} onClick={onClick}>
+									<planeGeometry attach="geometry" args={[0.96, 0.96]} />
+									<meshBasicMaterial attach="material" map={ownerTex} transparent opacity={0.82} />
+								</mesh>
+							) : null}
+							<mesh rotation-y={Math.PI / 3.8} position={[0, 1, 0]}>
+								<planeGeometry attach="geometry" args={[1, 1]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(emoji)}.png`)} transparent />
+							</mesh>
+							<mesh rotation-x={rotation_x} rotation-z={Math.PI / 0.0815} position={[0, 0.53, 0]}>
+								<planeGeometry attach="geometry" args={[0.7, 0.7]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(propertyEmoji)}.png`)} transparent />
+							</mesh>
+							<Html className="clipped">
+								<div className="emoji color property" level={field.property.level} x={props.position.x} z={props.position.z}></div>
+							</Html>
+						</group>
+						</>
+					}
+					/*
+						개발 Part 87 (빈 땅 소유 표시)
+						즉시 구매로 "주인은 있는데 건물은 없는" 칸이 생긴다.
+						현행 분기는 level > 0 일 때만 blockies 를 깔았으므로
+						땅을 사도 화면이 전혀 바뀌지 않았다.
+						여기서 바닥만 소유자 아이콘으로 덮는다.
+						  건물 이모지는 없다(아직 짓지 않았다)
+						  높이는 0.52 로 부동산 분기와 같다
+						useLoader 는 1개다. 이 갈래의 기본 반환과 같은 수이므로
+						훅 순서가 어긋나지 않는다.
+					*/
+					if(field.property && (field.property.level * 1) <= 0){
+						var landHash = window.TileOwner ? window.TileOwner(field) : ""
+						var landTex = landHash && window.OwnerTexture
+							? window.OwnerTexture(landHash) : null
+						if(landTex){
+							return <>
 							<group position={props.position}>
 								<mesh position={[0, 0, 0.005]} onClick={onClick}>
 									<boxGeometry attach="geometry" args={[1, 1]} />
 									<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color={color} />
 								</mesh>
+								<mesh rotation-x={rotation_x} position={[0, 0.52, 0]} onClick={onClick}>
+									<planeGeometry attach="geometry" args={[0.96, 0.96]} />
+									<meshBasicMaterial attach="material" map={landTex} transparent opacity={0.82} />
+								</mesh>
 								<mesh rotation-y={Math.PI / 3.8} position={[0, 1, 0]}>
 									<planeGeometry attach="geometry" args={[1, 1]} />
 									<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(emoji)}.png`)} transparent />
 								</mesh>
-								<mesh rotation-x={rotation_x} rotation-z={Math.PI / 0.0815} position={[0, 0.52, 0]}>
-									<planeGeometry attach="geometry" args={[0.5, 0.5]} />
-									<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(field.item || field.drop)}.png`)} transparent />
-								</mesh>
-
 								<Html className="clipped">
-									<div className="emoji color" x={props.position.x} z={props.position.z}></div>
+									<div className="emoji color owned" x={props.position.x} z={props.position.z}></div>
 								</Html>
 							</group>
-						</>	
+							</>
+						}
 					}
+					if(field.item || field.drop){
+						return <>
+						<group position={props.position}>
+							<mesh position={[0, 0, 0.005]} onClick={onClick}>
+								<boxGeometry attach="geometry" args={[1, 1]} />
+								<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color={color} />
+							</mesh>
+							<mesh rotation-y={Math.PI / 3.8} position={[0, 1, 0]}>
+								<planeGeometry attach="geometry" args={[1, 1]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(emoji)}.png`)} transparent />
+							</mesh>
+							<mesh rotation-x={rotation_x} rotation-z={Math.PI / 0.0815} position={[0, 0.52, 0]}>
+								<planeGeometry attach="geometry" args={[0.5, 0.5]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(field.item || field.drop)}.png`)} transparent />
+							</mesh>
+							<Html className="clipped">
+								<div className="emoji color" x={props.position.x} z={props.position.z}></div>
+							</Html>
+						</group>
+						</>
+					}
+				}
+				if(exitZone){
+					return <>
+					<group position={props.position}>
+						<mesh position={[0, 0, 0.005]} onClick={onClick}>
+							<boxGeometry attach="geometry" args={[1, 1]} />
+							<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color="#ffcc00" />
+						</mesh>
+						<mesh rotation-y={Math.PI / 3.8} position={[0, 1, 0]}>
+							<planeGeometry attach="geometry" args={[1, 1]} />
+							<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(emoji)}.png`)} transparent />
+						</mesh>
+						<Html className="clipped">
+							<div className="emoji color exit" x={props.position.x} z={props.position.z}></div>
+						</Html>
+					</group>
+					</>
 				}
 
 				return <>
@@ -464,24 +1327,131 @@ export const Experience = () => {
 				</>	
 			}else{
 				if(field){
-					if(field.item || field.drop){
+					if(field.jail){
+						/*
+							개발 Part 89 (jail 표시)
+							장식 이모지가 없는 갈래.
+							바로 아래 gate 분기가 이미 useLoader 1개를 쓰므로
+							같은 방식으로 ❓ 를 세운다.
+						*/
 						return <>
+						<group position={props.position}>
+							<mesh position={[0, 0, 0.005]} onClick={onClick}>
+								<boxGeometry attach="geometry" args={[1, 1]} />
+								<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color="#5a5a7a" />
+							</mesh>
+							<mesh rotation-x={rotation_x} rotation-z={Math.PI / 0.0815} position={[0, 0.52, 0]}>
+								<planeGeometry attach="geometry" args={[0.7, 0.7]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode("❓")}.png`)} transparent />
+							</mesh>
+							<Html className="clipped">
+								<div className="emoji color jail" x={props.position.x} z={props.position.z}></div>
+							</Html>
+						</group>
+						</>
+					}
+					if(field.gate){
+						return <>
+						<group position={props.position}>
+							<mesh position={[0, 0, 0.005]} onClick={onClick}>
+								<boxGeometry attach="geometry" args={[1, 1]} />
+								<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color="#ffcc00" />
+							</mesh>
+							<mesh rotation-x={rotation_x} rotation-z={Math.PI / 0.0815} position={[0, 0.52, 0]}>
+								<planeGeometry attach="geometry" args={[0.7, 0.7]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode("🚪")}.png`)} transparent />
+							</mesh>
+							<Html className="clipped">
+								<div className="emoji color gate" x={props.position.x} z={props.position.z}></div>
+							</Html>
+						</group>
+						</>
+					}
+					if(field.property && field.property.level > 0){
+						var propertyEmoji = PropertyLevelEmoji[field.property.level]
+						/* 개발 Part 70 : 소유자 blockies 바닥 (위 갈래와 동일 규칙) */
+						var ownerHash = window.TileOwner ? window.TileOwner(field) : ""
+						var ownerTex = ownerHash && window.OwnerTexture
+							? window.OwnerTexture(ownerHash) : null
+						return <>
+						<group position={props.position}>
+							<mesh position={[0, 0, 0.005]} onClick={onClick}>
+								<boxGeometry attach="geometry" args={[1, 1]} />
+								<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color={color} />
+							</mesh>
+							{ownerTex ? (
+								<mesh rotation-x={rotation_x} position={[0, 0.515, 0]} onClick={onClick}>
+									<planeGeometry attach="geometry" args={[0.96, 0.96]} />
+									<meshBasicMaterial attach="material" map={ownerTex} transparent opacity={0.82} />
+								</mesh>
+							) : null}
+							<mesh rotation-x={rotation_x} rotation-z={Math.PI / 0.0815} position={[0, 0.525, 0]}>
+								<planeGeometry attach="geometry" args={[0.7, 0.7]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(propertyEmoji)}.png`)} transparent />
+							</mesh>
+							<Html className="clipped">
+								<div className="emoji color property" level={field.property.level} x={props.position.x} z={props.position.z}></div>
+							</Html>
+						</group>
+						</>
+					}
+					if(field.property && (field.property.level * 1) <= 0){
+						var landHash2 = window.TileOwner ? window.TileOwner(field) : ""
+						var landTex2 = landHash2 && window.OwnerTexture
+							? window.OwnerTexture(landHash2) : null
+						if(landTex2){
+							return <>
 							<group position={props.position}>
 								<mesh position={[0, 0, 0.005]} onClick={onClick}>
 									<boxGeometry attach="geometry" args={[1, 1]} />
 									<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color={color} />
 								</mesh>
-								<mesh rotation-x={rotation_x} rotation-z={Math.PI / 0.0815} position={[0, 0.511, 0]}>
-									<planeGeometry attach="geometry" args={[0.5, 0.5]} />
-									<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(field.item || field.drop)}.png`)} transparent />
+								<mesh rotation-x={rotation_x} position={[0, 0.515, 0]} onClick={onClick}>
+									<planeGeometry attach="geometry" args={[0.96, 0.96]} />
+									<meshBasicMaterial attach="material" map={landTex2} transparent opacity={0.82} />
 								</mesh>
-
 								<Html className="clipped">
-									<div className="emoji color" x={props.position.x} z={props.position.z}></div>
+									<div className="emoji color owned" x={props.position.x} z={props.position.z}></div>
 								</Html>
 							</group>
-						</>	
+							</>
+						}
 					}
+					if(field.item || field.drop){
+						return <>
+						<group position={props.position}>
+							<mesh position={[0, 0, 0.005]} onClick={onClick}>
+								<boxGeometry attach="geometry" args={[1, 1]} />
+								<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color={color} />
+							</mesh>
+							<mesh rotation-x={rotation_x} rotation-z={Math.PI / 0.0815} position={[0, 0.511, 0]}>
+								<planeGeometry attach="geometry" args={[0.5, 0.5]} />
+								<meshBasicMaterial attach="material" map={useLoader(THREE.TextureLoader, `/src/fonts/emoji/emoji_u${window.emojiUnicode(field.item || field.drop)}.png`)} transparent />
+							</mesh>
+							<Html className="clipped">
+								<div className="emoji color" x={props.position.x} z={props.position.z}></div>
+							</Html>
+						</group>
+						</>
+					}
+				}
+				/*
+					개발 Part 65 (UCAV 탈출 구역)
+					이 갈래의 기본 반환은 useLoader 를 쓰지 않는다.
+					같은 개수(0개)를 유지해 훅 순서를 지킨다.
+				*/
+				if(exitZone){
+					return <>
+					<group position={props.position}>
+						<mesh position={[0, 0, 0.005]} onClick={onClick}>
+							<boxGeometry attach="geometry" args={[1, 1]} />
+							<meshStandardMaterial attach="material" map={textures[texture]} transparent opacity={opacity} color="#ffcc00" />
+						</mesh>
+						<Html className="clipped">
+							<div className="emoji color exit" x={props.position.x} z={props.position.z}></div>
+						</Html>
+					</group>
+					</>
 				}
 
 				return <>
@@ -495,18 +1465,17 @@ export const Experience = () => {
 							<div className="emoji color" x={props.position.x} z={props.position.z}></div>
 						</Html>
 					</group>
-				</>	
+				</>
 			}
-		}else{
-			return <>
-				<group position={props.position}>
-					<group></group>
-				</group>
-			</>
-		}
-	}
-
-	const { gl } = useThree();
+        }else{
+            return <>
+                <group position={props.position}>
+                    <group></group>
+                </group>
+            </>
+        }
+    })
+    const { gl } = useThree();
 
 	const onContextLost = function (event) {
 		event.preventDefault();
@@ -527,63 +1496,127 @@ export const Experience = () => {
 	window.players.self = self;
 
 	useEffect((e) => {
+		try{
+			if(window.FieldsSync){ window.FieldsSync() }
+		}catch(err){
+		}
 		window.players = players;
 		window.players.set = setPlayers;
 		window.players.self = self;
-
 		window.assets = assets
 		window.assets.set = setAssets
 
 		window.camera = camera;
 		window.camera.set = setCamera;
 
+		window.selector = selector;
+		window.selector.set = setSelector;
+
+		window.far = far;
+		window.far.set = setFar;
+
+		window.grid = grid
+
 		window.cursor = cursor;
 		window.current = current;
 
 		window.gl = gl
+	})
 
+	useEffect(() => {
 		window.addEventListener('click', onClick);
+		window.addEventListener('contextmenu', onContextmenu);
 		gl.domElement.addEventListener('webglcontextlost', onContextLost, false);
 
 		return () => {
 			window.removeEventListener('click', onClick);
+			window.removeEventListener('contextmenu', onContextmenu);
 			gl.domElement.removeEventListener('webglcontextlost', onContextLost, false)
 		}
-	})
+	}, [gl])
+
+	var mode = window.Mode()
 
 	return (
 		<>
 			<Suspense>
 				<Environment files="warehouse.hdr" />
 			</Suspense>
-
-			<mesh ref={cursor} rotation-x={-Math.PI / 2} position={[1.5, -0.001, 1.5]}>
+			<mesh ref={cursor} rotation-x={-Math.PI / 2} position={[1.5, -0.001, 1.5]} renderOrder={10}>
 				<planeGeometry attach="geometry" args={[0.6, 0.6]} />
-				<meshStandardMaterial attach="material" color={cursor.color} />
+				<meshBasicMaterial
+					attach="material"
+					color={cursor.color}
+					transparent
+					opacity={0.85}
+					toneMapped={false}
+					depthWrite={false}
+					polygonOffset
+					polygonOffsetFactor={-4}
+					polygonOffsetUnits={-4}
+				/>
+			</mesh>
+			<mesh ref={current} rotation-x={-Math.PI / 2} position={[1.5, 0, 1.5]} renderOrder={9}>
+				<planeGeometry attach="geometry" args={[0.9, 0.9]} />
+				<meshBasicMaterial
+					attach="material"
+					color={current.color}
+					transparent
+					opacity={0.45}
+					toneMapped={false}
+					depthWrite={false}
+					polygonOffset
+					polygonOffsetFactor={-3}
+					polygonOffsetUnits={-3}
+				/>
 			</mesh>
 
-			<mesh ref={current} rotation-x={-Math.PI / 2} position={[0.5, 0, 0.5]}>
-				<planeGeometry attach="geometry" args={[0.9, 0.9]} />
-				<meshStandardMaterial attach="material" color={current.color} />
-			</mesh>
+			{(mode == "room" && !(window.MapGen && window.MapGen.ready)) ? <RoomGrid onClick={onClick} /> : null}
 
 			<Suspense>
 				{assets.map((asset) => (
-					<Asset 
-						key={asset.id}
-						uid={asset.id}
-						hash={asset.hash}
-						name={asset.name}
-						value={asset.value}
-						color={asset.color}
-						position={
-							new THREE.Vector3(
-								asset.x,
-								asset.y,
-								asset.z
-							)
-						}
-					/>
+					(mode == "room" && (window.MapGen && window.MapGen.ready) && (asset.name + "").indexOf("chord") === 0) ? (
+						<ChordTile
+							key={asset.id + ":chord"}
+							uid={asset.id}
+							hash={asset.hash}
+							color={asset.color}
+							position={tileVec("c:" + asset.id, asset.x, asset.y, asset.z)}
+						/>
+                    ) : (mode == "room" && (window.MapGen && window.MapGen.ready) && (asset.name + "").indexOf("open") === 0) ? (
+                        <OpenTile
+                            key={asset.id}
+                            uid={asset.id}
+                            hash={asset.hash}
+                            name={asset.name}
+                            value={asset.value}
+                            blast={asset.blast}
+                            position={tileVec("o:" + asset.id, asset.x, asset.y, asset.z)}
+                        />
+                    ) : (mode == "room" && (asset.name + "").indexOf("#") !== 0) ? (
+						<RoomAsset
+							key={asset.id + ":" + asset.name}
+							uid={asset.id}
+							hash={asset.hash}
+							name={asset.name}
+							value={asset.value}
+							color={asset.color}
+							position={tileVec("r:" + asset.id, asset.x, asset.y, asset.z)}
+						/>
+					) : (
+						<Asset 
+							key={asset.id}
+							uid={asset.id}
+							hash={asset.hash}
+							name={asset.name}
+							value={asset.value}
+							color={asset.color}
+							own={asset.own}
+							deco={asset.deco}
+							zone={asset.zone}
+							position={tileVec("a:" + asset.id, asset.x, asset.y, asset.z)}
+						/>
+					)
 				))}
 			</Suspense>
 			
@@ -597,13 +1630,9 @@ export const Experience = () => {
 						emoji={player.emoji}
 						self={player.self}
 						follow={player.follow}
-						position={
-							new THREE.Vector3(
-								player.x,
-								player.y,
-								player.z
-							)
-						}
+						role={player.role}
+						dice={player.dice}
+						position={tileVec("p:" + player.hash, player.x, player.y, player.z)}
 					/>
 				))}
 			</Suspense>
